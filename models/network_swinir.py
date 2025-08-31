@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from .modules.ch_reg_mixer import ChannelRegMixer
 
 
 class Mlp(nn.Module):
@@ -737,6 +738,18 @@ class SwinIR(nn.Module):
 
         #####################################################################################################
         ################################ 3, high quality image reconstruction ################################
+        use_ch_reg_mixer = kwargs.pop('use_ch_reg_mixer', False)
+        if use_ch_reg_mixer:
+            self.ch_reg_mixer = ChannelRegMixer(
+                channels=embed_dim,
+                steps=kwargs.pop('ch_reg_steps', 2),
+                base_lambda=kwargs.pop('ch_reg_lambda', 0.03),
+                kappa=kwargs.pop('ch_reg_kappa', 0.03),
+                hidden=kwargs.pop('ch_reg_hidden', 64),
+                temperature=kwargs.pop('ch_reg_temp', 1.0),
+            )
+        else:
+            self.ch_reg_mixer = None
         if self.upsampler == 'pixelshuffle':
             # for classical SR
             self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
@@ -810,33 +823,49 @@ class SwinIR(nn.Module):
         x = (x - self.mean) * self.img_range
 
         if self.upsampler == 'pixelshuffle':
-            # for classical SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample(x)
-            x = self.conv_last(self.upsample(x))
+            # classical SR
+            x0 = self.conv_first(x)
+            fused = self.conv_after_body(self.forward_features(x0)) + x0
+            if self.ch_reg_mixer is not None:
+                fused, mix_w, lam_c = self.ch_reg_mixer(fused)
+                # optional diagnostics:
+                self._mix_w, self._lam_c = mix_w, lam_c
+            y = self.conv_before_upsample(fused)
+            y = self.conv_last(self.upsample(y))
+
         elif self.upsampler == 'pixelshuffledirect':
-            # for lightweight SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.upsample(x)
+            # lightweight SR
+            x0 = self.conv_first(x)
+            fused = self.conv_after_body(self.forward_features(x0)) + x0
+            if self.ch_reg_mixer is not None:
+                fused, mix_w, lam_c = self.ch_reg_mixer(fused)
+                self._mix_w, self._lam_c = mix_w, lam_c
+            y = self.upsample(fused)
+
         elif self.upsampler == 'nearest+conv':
-            # for real-world SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample(x)
-            x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
-            x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
-            x = self.conv_last(self.lrelu(self.conv_hr(x)))
+            # real-world SR (x4 only)
+            x0 = self.conv_first(x)
+            fused = self.conv_after_body(self.forward_features(x0)) + x0
+            if self.ch_reg_mixer is not None:
+                fused, mix_w, lam_c = self.ch_reg_mixer(fused)
+                self._mix_w, self._lam_c = mix_w, lam_c
+            y = self.conv_before_upsample(fused)
+            y = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(y, scale_factor=2, mode='nearest')))
+            y = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(y, scale_factor=2, mode='nearest')))
+            y = self.conv_last(self.lrelu(self.conv_hr(y)))
+
         else:
-            # for image denoising and JPEG compression artifact reduction
-            x_first = self.conv_first(x)
-            res = self.conv_after_body(self.forward_features(x_first)) + x_first
-            x = x + self.conv_last(res)
+            # denoising / JPEG path (no explicit upsampler)
+            x0 = self.conv_first(x)
+            res = self.conv_after_body(self.forward_features(x0)) + x0
+            if self.ch_reg_mixer is not None:
+                res, mix_w, lam_c = self.ch_reg_mixer(res)
+                self._mix_w, self._lam_c = mix_w, lam_c
+            y = x + self.conv_last(res)
 
-        x = x / self.img_range + self.mean
+        y = y / self.img_range + self.mean
+        return y[:, :, :H * self.upscale, :W * self.upscale]
 
-        return x[:, :, :H*self.upscale, :W*self.upscale]
 
     def flops(self):
         flops = 0
